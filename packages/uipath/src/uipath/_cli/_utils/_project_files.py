@@ -25,6 +25,34 @@ from ._studio_project import (
 logger = logging.getLogger(__name__)
 
 
+def resolve_existing_project_id(directory: str = ".") -> Optional[str]:
+    """Return an already-established project id for this project, if any.
+
+    Checks the Studio Web project env var first, then falls back to the legacy
+    ``ProjectKey`` stored in ``.uipath/.telemetry.json``. Returns ``None`` when
+    neither is present.
+
+    Args:
+        directory: The project root directory to look for the telemetry file in.
+    """
+    from ...telemetry._constants import _PROJECT_KEY, _TELEMETRY_CONFIG_FILE
+
+    if project_id := UiPathConfig.project_id:
+        return project_id
+
+    telemetry_file = os.path.join(directory, ".uipath", _TELEMETRY_CONFIG_FILE)
+    if os.path.exists(telemetry_file):
+        try:
+            with open(telemetry_file, "r") as f:
+                telemetry_data = json.load(f)
+                if project_id := telemetry_data.get(_PROJECT_KEY):
+                    return project_id
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    return None
+
+
 class Severity(IntEnum):
     LOG = 0
     WARNING = 1

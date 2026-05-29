@@ -68,6 +68,13 @@ class UiPathJsonConfig(BaseModelWithDefaultConfig):
         alias="$schema",
         description="Reference to the JSON schema for editor support",
     )
+    agent_id: str | None = Field(
+        default=None,
+        alias="agentId",
+        description="Stable unique identifier for the agent. Minted once at "
+        "project creation (by 'uipath init' or Studio Web) and preserved for the "
+        "lifetime of the project. Used as the package 'projectId' at pack time.",
+    )
     runtime_options: RuntimeOptions = Field(
         default_factory=RuntimeOptions,
         alias="runtimeOptions",

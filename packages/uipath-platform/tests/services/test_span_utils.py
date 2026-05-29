@@ -10,6 +10,16 @@ from opentelemetry.trace import SpanContext, StatusCode
 from uipath.platform.common import UiPathSpan, _SpanUtils
 
 
+@pytest.fixture(autouse=True)
+def _clear_agent_id_cache():
+    """Isolate the process-global agentId cache between tests."""
+    from uipath.platform.common._span_utils import _read_config_agent_id
+
+    _read_config_agent_id.cache_clear()
+    yield
+    _read_config_agent_id.cache_clear()
+
+
 class TestOTelToUiPathSpan:
     """OTEL attribute -> top-level UiPathSpan field mapping.
 
@@ -92,10 +102,11 @@ class TestOTelToUiPathSpan:
 class TestReferenceIdResolution:
     """`reference_id` resolution chain.
 
-    Priority: `UIPATH_AGENT_ID` env var > `agentId` attribute > `referenceId`
-    attribute. Falsy values (missing / empty string) at each step fall through
-    to the next source. The `referenceId` fallback exists for backwards
-    compatibility with older producers that only emit that attribute.
+    `reference_id` is derived from the span's resolved `agentId` attribute
+    (which itself goes through `resolve_agent_id()`), falling back to the
+    `referenceId` attribute. Falsy values (missing / empty string) at each step
+    fall through to the next source. The `referenceId` fallback exists for
+    backwards compatibility with older producers that only emit that attribute.
     """
 
     @pytest.mark.parametrize(
@@ -105,7 +116,7 @@ class TestReferenceIdResolution:
                 "env-agent",
                 {"agentId": "attr-agent", "referenceId": "attr-ref"},
                 "env-agent",
-                id="env-var-wins",
+                id="env-var-overrides-attr",
             ),
             pytest.param(
                 None,
@@ -140,6 +151,10 @@ class TestReferenceIdResolution:
         expected: str | None,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from uipath.platform.common._span_utils import _read_config_agent_id
+
+        _read_config_agent_id.cache_clear()
+        monkeypatch.delenv("PROJECT_KEY", raising=False)
         if env_value is None:
             monkeypatch.delenv("UIPATH_AGENT_ID", raising=False)
         else:
@@ -164,6 +179,129 @@ class TestReferenceIdResolution:
 
         uipath_span = _SpanUtils.otel_span_to_uipath_span(mock_span)
         assert uipath_span.reference_id == expected
+
+
+class TestAgentIdResolution:
+    """`agentId` span attribute resolution via `resolve_agent_id()`.
+
+    Priority: `uipath.json#agentId` (cached, read once per process) >
+    `UIPATH_AGENT_ID` env var > the legacy `PROJECT_KEY` env var injected by
+    the executor. When no source is present the `agentId` attribute is omitted
+    entirely.
+    """
+
+    @staticmethod
+    def _make_span() -> Mock:
+        mock_span = Mock(spec=OTelSpan)
+        mock_context = SpanContext(
+            trace_id=0x123456789ABCDEF0123456789ABCDEF0,
+            span_id=0x0123456789ABCDEF,
+            is_remote=False,
+        )
+        mock_span.get_span_context.return_value = mock_context
+        mock_span.name = "test-span"
+        mock_span.parent = None
+        mock_span.status.status_code = StatusCode.OK
+        mock_span.attributes = {}
+        mock_span.events = []
+        mock_span.links = []
+        now_ns = int(datetime.now().timestamp() * 1e9)
+        mock_span.start_time = now_ns
+        mock_span.end_time = now_ns + 1_000_000
+        return mock_span
+
+    @staticmethod
+    def _resolve(monkeypatch: pytest.MonkeyPatch, tmp_path) -> object:
+        from uipath.platform.common._span_utils import _read_config_agent_id
+
+        _read_config_agent_id.cache_clear()
+        monkeypatch.delenv("UIPATH_CONFIG_PATH", raising=False)
+        monkeypatch.delenv("UIPATH_AGENT_ID", raising=False)
+        monkeypatch.chdir(tmp_path)
+        uipath_span = _SpanUtils.otel_span_to_uipath_span(
+            TestAgentIdResolution._make_span(), serialize_attributes=False
+        )
+        attributes = uipath_span.attributes
+        assert isinstance(attributes, dict)
+        return attributes.get("agentId")
+
+    def test_agent_id_from_uipath_json_wins_over_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        (tmp_path / "uipath.json").write_text(json.dumps({"agentId": "from-config"}))
+        monkeypatch.setenv("PROJECT_KEY", "from-env")
+        assert self._resolve(monkeypatch, tmp_path) == "from-config"
+
+    def test_agent_id_from_uipath_json_wins_over_agent_id_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        (tmp_path / "uipath.json").write_text(json.dumps({"agentId": "from-config"}))
+        monkeypatch.setenv("UIPATH_AGENT_ID", "from-agent-env")
+        # _resolve clears UIPATH_AGENT_ID, so set it back after the fixture work
+        # is done via a direct resolve call instead.
+        from uipath.platform.common._span_utils import (
+            _read_config_agent_id,
+            resolve_agent_id,
+        )
+
+        _read_config_agent_id.cache_clear()
+        monkeypatch.chdir(tmp_path)
+        assert resolve_agent_id() == "from-config"
+
+    def test_agent_id_env_wins_over_project_key_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # No uipath.json on disk.
+        from uipath.platform.common._span_utils import (
+            _read_config_agent_id,
+            resolve_agent_id,
+        )
+
+        _read_config_agent_id.cache_clear()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("UIPATH_AGENT_ID", "from-agent-env")
+        monkeypatch.setenv("PROJECT_KEY", "from-project-key")
+        assert resolve_agent_id() == "from-agent-env"
+
+    def test_agent_id_falls_back_to_project_key_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # No uipath.json on disk.
+        monkeypatch.setenv("PROJECT_KEY", "from-env")
+        assert self._resolve(monkeypatch, tmp_path) == "from-env"
+
+    def test_agent_id_falls_back_when_config_has_no_agent_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        (tmp_path / "uipath.json").write_text(json.dumps({"functions": {}}))
+        monkeypatch.setenv("PROJECT_KEY", "from-env")
+        assert self._resolve(monkeypatch, tmp_path) == "from-env"
+
+    def test_agent_id_absent_when_no_source(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.delenv("PROJECT_KEY", raising=False)
+        assert self._resolve(monkeypatch, tmp_path) is None
+
+    def test_config_agent_id_is_cached(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from uipath.platform.common._span_utils import _read_config_agent_id
+
+        _read_config_agent_id.cache_clear()
+        monkeypatch.delenv("UIPATH_CONFIG_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        config = tmp_path / "uipath.json"
+
+        config.write_text(json.dumps({"agentId": "first"}))
+        assert _read_config_agent_id() == "first"
+
+        # A later edit is not observed: the value is read once and cached.
+        config.write_text(json.dumps({"agentId": "second"}))
+        assert _read_config_agent_id() == "first"
+
+        _read_config_agent_id.cache_clear()
+        assert _read_config_agent_id() == "second"
 
 
 class TestNormalizeIds:

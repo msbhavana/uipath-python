@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import IntEnum
+from functools import lru_cache
 from os import environ as env
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,45 @@ logger = logging.getLogger(__name__)
 
 # SourceEnum.CodedAgents = 10 (default for Python SDK / coded agents)
 DEFAULT_SOURCE = 10
+
+
+@lru_cache(maxsize=1)
+def _read_config_agent_id() -> Optional[str]:
+    """Return ``agentId`` from ``uipath.json``, cached for the process lifetime.
+
+    Spans are produced on a hot path, so the project descriptor is read at most
+    once. Returns ``None`` when the file or the ``agentId`` field is absent, so
+    the caller can fall back to the legacy env vars.
+    """
+    from uipath.platform.common._config import UiPathConfig
+
+    try:
+        with open(UiPathConfig.config_file_path, "r") as f:
+            agent_id = json.load(f).get("agentId")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    return agent_id if isinstance(agent_id, str) and agent_id else None
+
+
+def resolve_agent_id() -> Optional[str]:
+    """Resolve the agent id from a single, ordered set of sources.
+
+    Order: ``uipath.json#agentId`` (the stable id minted at init time) ->
+    ``UIPATH_AGENT_ID`` env var -> legacy ``PROJECT_KEY`` env var injected by
+    the executor. All span fields carrying an agent identity must go through
+    this helper so they cannot diverge.
+    """
+    from uipath.platform.common.constants import (
+        ENV_PROJECT_KEY,
+        ENV_UIPATH_AGENT_ID,
+    )
+
+    return (
+        _read_config_agent_id()
+        or env.get(ENV_UIPATH_AGENT_ID)
+        or env.get(ENV_PROJECT_KEY)
+    )
 
 
 class AttachmentProvider(IntEnum):
@@ -281,9 +321,14 @@ class _SpanUtils:
             ]
             attributes_dict["links"] = links_list
 
+        # agentId: prefer the stable id from uipath.json (cached), falling back
+        # to the legacy env vars injected by the executor.
+        agent_id = resolve_agent_id()
+        if agent_id:
+            attributes_dict["agentId"] = agent_id
+
         # Add process context attributes from environment variables
         for env_key, attr_key in (
-            ("PROJECT_KEY", "agentId"),
             ("UIPATH_PROCESS_KEY", "agentName"),
             ("UIPATH_PROCESS_VERSION", "agentVersion"),
         ):
@@ -297,10 +342,8 @@ class _SpanUtils:
         # Top-level fields for internal tracing schema
         execution_type = attributes_dict.get("executionType")
         agent_version = attributes_dict.get("agentVersion")
-        reference_id = (
-            env.get("UIPATH_AGENT_ID")
-            or attributes_dict.get("agentId")
-            or attributes_dict.get("referenceId")
+        reference_id = attributes_dict.get("agentId") or attributes_dict.get(
+            "referenceId"
         )
         verbosity_level = attributes_dict.get("verbosityLevel")
 

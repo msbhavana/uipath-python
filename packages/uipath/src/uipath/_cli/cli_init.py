@@ -36,7 +36,7 @@ from ._telemetry import track_command
 from ._utils._common import determine_project_type
 from ._utils._console import ConsoleLogger
 from ._utils._constants import AGENT_INITIAL_CODE_VERSION, SCHEMA_VERSION
-from ._utils._project_files import read_toml_project
+from ._utils._project_files import read_toml_project, resolve_existing_project_id
 from .middlewares import Middlewares
 from .models.runtime_schema import Bindings, EntryPoint
 from .models.uipath_json_schema import UiPathJsonConfig
@@ -429,10 +429,26 @@ def init(no_agents_md_override: bool) -> None:
                 config_path = UiPathConfig.config_file_path
                 if not config_path.exists():
                     config = UiPathJsonConfig.create_default()
+                    config.agent_id = resolve_existing_project_id(
+                        current_directory
+                    ) or str(uuid.uuid4())
                     config.save_to_file(config_path)
                     console.success(f"{Action.CREATED.value} '{config_path}' file.")
                 else:
-                    console.info(f"'{config_path}' already exists, skipping.")
+                    # backfill agentId if not present. Edit the raw JSON so the
+                    # rest of the user's file (key order, omitted defaults) is
+                    # left untouched.
+                    with open(config_path, "r") as f:
+                        raw_config = json.load(f)
+                    if not raw_config.get("agentId"):
+                        raw_config["agentId"] = resolve_existing_project_id(
+                            current_directory
+                        ) or str(uuid.uuid4())
+                        with open(config_path, "w") as f:
+                            json.dump(raw_config, f, indent=2)
+                        console.success(
+                            f"{Action.UPDATED.value} '{config_path}' file with 'agentId'."
+                        )
 
                 # Create bindings.json if it doesn't exist
                 bindings_path = UiPathConfig.bindings_file_path
